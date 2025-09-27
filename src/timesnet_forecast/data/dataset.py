@@ -81,6 +81,9 @@ class SlidingWindowDataset(Dataset):
         # In recursive mode ``self.H`` may be 1 (training) or >1 (validation).
         self._X_tensor = torch.from_numpy(self.X)
         self._M_tensor = torch.from_numpy(self.M)
+        if torch.cuda.is_available():
+            self._X_tensor = self._X_tensor.pin_memory()
+            self._M_tensor = self._M_tensor.pin_memory()
 
         self.time_feature_dim: int = 0
         self.time_feature_config = dict(time_feature_config or {})
@@ -145,7 +148,10 @@ class SlidingWindowDataset(Dataset):
                 raise ValueError(
                     "series_static must have shape [num_series, num_features]"
                 )
-            self.series_static = torch.from_numpy(static_arr)
+            tensor = torch.from_numpy(static_arr)
+            if torch.cuda.is_available():
+                tensor = tensor.pin_memory()
+            self.series_static = tensor
         else:
             self.series_static = None
 
@@ -155,7 +161,10 @@ class SlidingWindowDataset(Dataset):
                 raise ValueError("series_ids must be a 1D sequence")
             if ids_arr.shape[0] != self.N:
                 raise ValueError("series_ids length must match number of series")
-            self.series_ids = torch.from_numpy(ids_arr.astype(np.int64, copy=False))
+            ids_tensor = torch.from_numpy(ids_arr.astype(np.int64, copy=False))
+            if torch.cuda.is_available():
+                ids_tensor = ids_tensor.pin_memory()
+            self.series_ids = ids_tensor
         else:
             self.series_ids = None
 
@@ -176,25 +185,29 @@ class SlidingWindowDataset(Dataset):
             delta = np.random.randint(-self.time_shift, self.time_shift + 1)
             s = int(np.clip(s + delta, 0, self.T - self.L - self.H))
         e = s + self.L
-        x_tensor = self._X_tensor[s:e, series_idx : series_idx + 1].clone()
+        # ``narrow`` avoids extra tensor allocations while keeping slices
+        # compatible with the default collation logic. Clones are only
+        # materialized when augmentations mutate the data.
+        x_tensor = self._X_tensor.narrow(0, s, self.L).narrow(1, series_idx, 1)
         if self.add_noise_std > 0:
+            x_tensor = x_tensor.clone()
             noise = torch.randn_like(x_tensor) * self.add_noise_std
             x_tensor = x_tensor + noise
-        y_tensor = self._X_tensor[e : e + self.H, series_idx : series_idx + 1].clone()
-        mask_tensor = self._M_tensor[e : e + self.H, series_idx : series_idx + 1].clone()
+        y_tensor = self._X_tensor.narrow(0, e, self.H).narrow(1, series_idx, 1)
+        mask_tensor = self._M_tensor.narrow(0, e, self.H).narrow(1, series_idx, 1)
         if self.time_marks is not None:
-            x_mark = self.time_marks[s:e, :].clone()
-            y_mark = self.time_marks[e : e + self.H, :].clone()
+            x_mark = self.time_marks.narrow(0, s, self.L)
+            y_mark = self.time_marks.narrow(0, e, self.H)
         else:
             x_mark = self._empty_time_mark
             y_mark = self._empty_time_mark
         items: list[object] = [x_tensor, y_tensor, mask_tensor, x_mark, y_mark]
         if self.series_static is not None:
-            static_slice = self.series_static[series_idx : series_idx + 1, :]
-            items.append(static_slice.clone())
+            static_slice = self.series_static.narrow(0, series_idx, 1)
+            items.append(static_slice)
         if self.series_ids is not None:
-            id_slice = self.series_ids[series_idx : series_idx + 1]
-            items.append(id_slice.clone())
+            id_slice = self.series_ids.narrow(0, series_idx, 1)
+            items.append(id_slice)
         return tuple(items)
 
     @staticmethod
